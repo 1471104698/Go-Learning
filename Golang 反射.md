@@ -360,7 +360,52 @@ func main() {
 上面我们可以看出
 
 - 如果 Value 传入的是指针，那么它可以反射调用参数构造器为 值和指针 的方法
-
 - 如果 Value 传入的是值，那么它只能调用参数构造器为 值 的方法，它无法获取到 参数构造器为指针的方法
 - 反射无法获取、调用私有方法
 
+
+
+## 4、为什么反射无法获取私有方法？
+
+
+
+> #### Value 中 MethodByName() 调用逻辑
+
+```go
+//Value MethodByName
+func (v Value) MethodByName(name string) Value {
+	if v.typ == nil {
+		panic(&ValueError{"reflect.Value.MethodByName", Invalid})
+	}
+	if v.flag&flagMethod != 0 {
+		return Value{}
+	}
+	// 调用 value 中维护的 Type 对象的 MethodByName
+	m, ok := v.typ.MethodByName(name)
+	if !ok {
+		return Value{}
+	}
+	return v.Method(m.Index)
+}
+
+// Type MethodByName
+func (t *rtype) MethodByName(name string) (m Method, ok bool) {
+	if t.Kind() == Interface {
+		tt := (*interfaceType)(unsafe.Pointer(t))
+		return tt.MethodByName(name)
+	}
+	ut := t.uncommon()
+	if ut == nil {
+		return Method{}, false
+	}
+    // 获取所有可导出方法列表，遍历，获取方法名匹配的，返回
+	for i, p := range ut.exportedMethods() {
+		if t.nameOff(p.name).name() == name {
+			return t.Method(i), true
+		}
+	}
+	return Method{}, false
+}
+```
+
+可以看到 Value 的 MethodByName 实际上调用的是 Type 的 MethodByName，而在该方法内部它是通过 exportedMethods() 获取可导出方法列表再进行匹配的，因此，如果是私有方法，那么这里一定匹配不成功，因为它一开始就过滤了私有方法
