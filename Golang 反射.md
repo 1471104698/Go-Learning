@@ -274,11 +274,13 @@ func main() {
 
 
 
-> #### 问题：为什么传入指针后还需要调用 Elem() ？
+#### 问题：为什么需要调用 Elem() ？
 
-Elem() 获取的是指针指向的真实值，在 Value 结构体中同样维护了一个变量 flag，可以把它理解为是否能够进行修改
+首先百度说 Elem() 获取的是指针指向的值的 Value
 
-Elem() 代码如下：
+
+
+我们看代码，Elem() 代码如下：
 
 ```go
 func (v Value) Elem() Value {
@@ -297,24 +299,46 @@ func (v Value) Elem() Value {
 		}
 		tt := (*ptrType)(unsafe.Pointer(v.typ))
 		typ := tt.elem
-        // 重新计算新的 Value 的 flag
+        // 特定的计算公式，重新计算新的 Value 的 flag
 		fl := v.flag&flagRO | flagIndir | flagAddr
+        // flag 此时的计算跟 ptr 指向的值的类型 Kind() 是挂钩的了, ptr flag 和 结构体 flag 的固定值为 409
 		fl |= flag(typ.Kind())
+        // 返回的新的 Value 内部的值仍然是 v 内部的指针
 		return Value{typ, ptr, fl}
 	}
 	panic(&ValueError{"reflect.Value.Elem", v.kind()})
 }
 ```
 
-我们可以看出，如果 v 是指针，那么它会重新计算指向的值的 flag
+我们可以看出，如果 v 是指针，那么它会重新计算指向的值的 flag，这个值会跟 指针指向的值的类型进行运算，得到该类型下的 flag，但是返回的新的 Value 内部的值是 v 内部的值，即是同一个指针
 
-我们可以推测这样的逻辑：如果 ValueOf() 传入的是值或者指针，那么它的 flag 值在 CanSet() 中通过计算后函数返回的是 false，即它的 flag 值就表示当前 Value 不支持修改，如果传入指针的 Value v 调用 Elem() 后，它根据 v 的 flag 重新计算得到的新的 flag 表示的是新的 Value 能够进行修改
+在 reflect 中，指针 ptr 的 flag = 22，nil 的 flag = 0，结构体的 flag = 153
 
-也就是说，Value 结构体中的 flag 是一个表示当前值是否能够修改的标志，它的值的设计很nb，当 Value 为值或者指针时，那么它对应的 flag 最终计算得到的是 不支持修改，如果 Value 是指针 Value 调用 Elem() 后返回的，那么它的 flag 最终计算得到的是支持修改，那么就能够进行修改
+也就是说，对于每一种数据类型（这里具体指 Kind()，比如 struct、ptr）来说，它们都有一个固定搭配的 flag
+
+也就是说 flag 是用来标识 Value 内部值的类型的，后续一些 Valid 判断之类的，都是基于 flag 的
+
+最开始创建 Value 的时候，内部值是指针，flag = 22，标识它是指针类型，而在 Elem() 返回的 Value 中，内部值仍然是同一个指针，但是它的 flag 是 ptr 和 struct 共同计算出来 ，flag = 409。
+
+对于 CanSet() 之类的方法，它是通过 flag 来进行判断的，
+
+```go
+func (v Value) CanSet() bool {
+	return v.flag&(flagAddr|flagRO) == flagAddr
+}
+```
+
+通过特定的计算公式，ptr  的 flag = 22 计算后不等于 flagAddr，因此无法修改
+
+Elem() 返回后对应的 ptr 的 flag = 409 计算后等于 flagAddr，因此可以修改，以此来区分 ptr Value 是否调用过 Elem()
 
 
 
-### 3.2、调用方法
+具体为什么需要调用 Elem() 去修改 flag 而不能直接在原 Value 上修改，个人推测是这个计算公式的原因，因为 CanSet() 需要判断的不只有 ptr，还有 int 之类的数据类型，而设置 ptr 的 flag = 22 计算后无法等于 flagAddr，因此需要调用 Elem() 进行调整
+
+
+
+### 3.3、调用方法
 
 ```go
 type People struct {
