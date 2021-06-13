@@ -409,3 +409,252 @@ func (t *rtype) MethodByName(name string) (m Method, ok bool) {
 ```
 
 可以看到 Value 的 MethodByName 实际上调用的是 Type 的 MethodByName，而在该方法内部它是通过 exportedMethods() 获取可导出方法列表再进行匹配的，因此，如果是私有方法，那么这里一定匹配不成功，因为它一开始就过滤了私有方法
+
+
+
+
+
+## 5、IsZero()、IsNil()、IsValid() 三大方法
+
+### 5.1、IsZero()
+
+```go
+func (v Value) IsZero() bool {
+	switch v.kind() {
+	case Bool:
+		return !v.Bool()
+	case Int, Int8, Int16, Int32, Int64:
+		return v.Int() == 0
+	case Uint, Uint8, Uint16, Uint32, Uint64, Uintptr:
+		return v.Uint() == 0
+	case Float32, Float64:
+		return math.Float64bits(v.Float()) == 0
+	case Complex64, Complex128:
+		c := v.Complex()
+		return math.Float64bits(real(c)) == 0 && math.Float64bits(imag(c)) == 0
+	case Array:
+		for i := 0; i < v.Len(); i++ {
+			if !v.Index(i).IsZero() {
+				return false
+			}
+		}
+		return true
+	case Chan, Func, Interface, Map, Ptr, Slice, UnsafePointer:
+		return v.IsNil()
+	case String:
+		return v.Len() == 0
+	case Struct:
+		for i := 0; i < v.NumField(); i++ {
+			if !v.Field(i).IsZero() {
+				return false
+			}
+		}
+		return true
+	default:
+		// This should never happens, but will act as a safeguard for
+		// later, as a default value doesn't makes sense here.
+		panic(&ValueError{"reflect.Value.IsZero", v.Kind()})
+	}
+}
+```
+
+
+
+该方法用来判断 Value 内部的值是否是零值
+
+不同类型的判断方法如下：
+
+- 基本数据类型：
+  - int、int32、float32、byte、uint 等判断是否是 0
+  - string 是否是 ""（len == 0）
+  - bool 是否是 false
+- 结构体：结构体内部所有变量是否都是零值，但凡有一个不是那么返回 false
+- 数组 Array：判断内部的每个元素是否都是零值，但凡有一个不是那么返回 false
+  - 实际开发中 Array 基本不用
+- slice、map、chan、func、unsafe.Pointer、interface：判断是否为 nil
+  - （注意，slice 的 nil 实际上是已经创建 24byte 的结构体了，只不过内部的数据指针为 nil）
+
+
+
+> #### 例子1：测试基本数据类型
+
+```go
+func main() {
+    // 1、测试基本数据类型
+    var i int = 0
+	v := reflect.ValueOf(i)	// 这里不能传指针，否则变成了 ptr
+    fmt.Println(v.IsZero())	// true
+    
+    i = 1
+    v = reflect.ValueOf(i)
+    fmt.Println(v.IsZero())	// false
+}
+```
+
+
+
+> #### 例子2：测试结构体
+
+```go
+type People struct {
+	a int
+	b string
+}
+func main() {
+    p := People{}
+    v2 := reflect.ValueOf(p)
+    fmt.Println(v2.IsZero())	// true
+    
+    p = People{				// 这里不能使用 p.a = 1 直接修改上一个结构体的原因是传入 v2 中的 p 是值传递，这里修改了也不会影响到 v2 中的副本
+        a:  1,
+    }
+    v2 = reflect.ValueOf(p)
+    fmt.Println(v2.IsZero())	// false
+}
+```
+
+
+
+> #### 例子3：测试 slice
+
+```go
+func main() {
+	var is []int
+	v3 := reflect.ValueOf(is)
+	fmt.Println(v3.IsZero()) // true
+
+	is = append(is, 1)
+    v3 = reflect.ValueOf(is) // 这里不沿用上面的 v3 是因为 append() 后 is 这里绝对会发生扩容，那么原本 v3 持有的仍然是旧的 is
+	fmt.Println(v3.IsZero()) // false
+    
+    is = []int{}
+    v3 = reflect.ValueOf(is)
+	fmt.Println(v3.IsZero()) // false
+}
+```
+
+
+
+> #### 例子4：测试 map
+
+```go
+func main() {
+	var m map[int]struct{}
+	v4 := reflect.ValueOf(m)
+	fmt.Println(v4.IsZero()) // true
+
+	m = map[int]struct{}{}
+	v4 = reflect.ValueOf(m)
+	fmt.Println(v4.IsZero()) // false
+}
+```
+
+
+
+### 5.2、IsNil()
+
+```go
+func (v Value) IsNil() bool {
+	k := v.kind()
+	switch k {
+	case Chan, Func, Map, Ptr, UnsafePointer:
+		if v.flag&flagMethod != 0 {
+			return false
+		}
+		ptr := v.ptr
+		if v.flag&flagIndir != 0 {
+			ptr = *(*unsafe.Pointer)(ptr)
+		}
+		return ptr == nil
+	case Interface, Slice:
+		// Both interface and slice are nil if first word is 0.
+		// Both are always bigger than a word; assume flagIndir.
+		return *(*unsafe.Pointer)(v.ptr) == nil
+	}
+	panic(&ValueError{"reflect.Value.IsNil", v.kind()})
+}
+```
+
+判断 Value 中的值是否是 nil，只能作用于能够进行 nil 判断的数据类型：slice、map、chan、func、interface、unsafe.Pointer
+
+其他的数据类型会报错：`reflect.Value.IsNil`
+
+
+
+### 5.3、IsValid()
+
+```go
+func (v Value) IsValid() bool {
+	return v.flag != 0
+}
+```
+
+判断 Value 内的值是否为 nil
+
+- 如果不为 nil，那对应的 flag != 0，返回 true
+- 如果为 nil，那对应的 flag == 0，那么返回 false
+
+flag 可以理解为一个标识，在创建 Value 的时候会根据变量类型去计算这个 flag，如果为 nil，那么赋值为 0，其他的比如 ptr 类型的值会赋值为 flag = 22
+
+
+
+> #### 例子1：测试基本数据类型
+
+```go
+func main() {
+	i := 0
+	v := reflect.ValueOf(i)
+	fmt.Println(v.IsValid()) // true
+}
+```
+
+
+
+> #### 例子2：测试 nil
+
+```go
+func main() {
+	v2 := reflect.ValueOf(nil)
+	fmt.Println(v2.IsValid())        // false，对于 go 来说，nil 只是一个标识，编译器读取到 nil 这个标识就会做出对应的操作
+}
+```
+
+
+
+> #### 例子3：测试指针类型
+
+```go
+func main() {
+	var ip *int = nil
+	v3 := reflect.ValueOf(ip)
+	fmt.Println(v3.IsValid())        // true，ip 本身是一个指针，不过它本身并没有指向任何的值而已，因此对于 v3 内部并不是 nil
+    fmt.Println(v3.Elem().IsValid()) // false，ip 没有指向任何值，所以 Elem() 返回的 Value 内部为 nil
+}
+```
+
+实际上 slice、map、chan 传入的效果类似 指针，Value 内部都不会是 nil，因此必定返回 true
+
+
+
+> #### 例子4：测试结构体
+
+```go
+type People struct {
+	a int
+	b int64
+}
+func main() {
+    var p People
+    v4 := reflect.ValueOf(p)
+    fmt.Println(v4.IsValid()) 	// true
+    
+    // 获取 p 中存在的字段 Value
+    v5 := v4.FieldByName("a")
+    fmt.Println(v5.IsValid()) 	// true
+    
+    // 获取 p 中不存在的字段 Value
+    v5 = v4.FieldByName("f")
+    fmt.Println(v5.IsValid()) 	// false
+}
+```
+
