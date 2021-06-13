@@ -61,7 +61,7 @@ type Type interface {
 	 // 获取变量的个数
 	 NumField() int
     
-     // 返回该类型的名称，比如 People、a
+     // 返回该类型的名称，比如 People、int
      Name() string
 
      // 获取所在的包名
@@ -291,6 +291,7 @@ func (v Value) Elem() Value {
 	case Ptr:
 		ptr := v.ptr
 		if v.flag&flagIndir != 0 {
+            // 解引用
 			ptr = *(*unsafe.Pointer)(ptr)
 		}
 		// The returned value's address is v's value.
@@ -310,31 +311,59 @@ func (v Value) Elem() Value {
 }
 ```
 
-我们可以看出，如果 v 是指针，那么它会重新计算指向的值的 flag，这个值会跟 指针指向的值的类型进行运算，得到该类型下的 flag，但是返回的新的 Value 内部的值是 v 内部的值，即是同一个指针
+我们可以看出，对于 v.Kind() = ptr 的，它内部主要进行以下四步：
 
-在 reflect 中，指针 ptr 的 flag = 22，nil 的 flag = 0，结构体的 flag = 153
+- 获取 v.ptr，然后再将 v.ptr 进行解引用得到新的指针 ptr
+- 获取指针指向的值的数据类型，封装成一个新的 type
+- 重新计算 flag
+- 将新的 ptr、type、flag 封装成一个新的  Value 返回
 
-也就是说，对于每一种数据类型（这里具体指 Kind()，比如 struct、ptr）来说，它们都有一个固定搭配的 flag
+我们可以看到最终返回的 Value 内部的值也是指针 ptr，而不是什么具体的数据
 
-也就是说 flag 是用来标识 Value 内部值的类型的，后续一些 Valid 判断之类的，都是基于 flag 的
 
-最开始创建 Value 的时候，内部值是指针，flag = 22，标识它是指针类型，而在 Elem() 返回的 Value 中，内部值仍然是同一个指针，但是它的 flag 是 ptr 和 struct 共同计算出来 ，flag = 409。
 
-对于 CanSet() 之类的方法，它是通过 flag 来进行判断的，
+那么这个 Elem() 的意义是什么？这里是个人猜测：
+
+首先我们看 reflect.ValueOf() 的代码：
 
 ```go
-func (v Value) CanSet() bool {
-	return v.flag&(flagAddr|flagRO) == flagAddr
+func ValueOf(i interface{}) Value {
+	if i == nil {
+		return Value{}
+	}
+	// 构造 Value 的具体过程
+	return unpackEface(i)
+}
+
+func unpackEface(i interface{}) Value {
+    // 重点代码
+	e := (*emptyInterface)(unsafe.Pointer(&i))
+    
+	t := e.typ
+	if t == nil {
+		return Value{}
+	}
+	f := flag(t.Kind())
+	if ifaceIndir(t) {
+		f |= flagIndir
+	}
+	return Value{t, e.word, f}
 }
 ```
 
-通过特定的计算公式，ptr  的 flag = 22 计算后不等于 flagAddr，因此无法修改
+在上面我们可以看到它存在以下一行代码：
 
-Elem() 返回后对应的 ptr 的 flag = 409 计算后等于 flagAddr，因此可以修改，以此来区分 ptr Value 是否调用过 Elem()
+```go
+e := (*emptyInterface)(unsafe.Pointer(&i))
+```
+
+它对 i 进行 & 取地址然后再强转为 unsafe.Pointer，再封装为 *emptyInterface（这里具体为何强转成 *emptyInterface 后就已经存在数据了，个人猜测是编译器识别到后做了处理了）
+
+即如果我们传入的 i 是指针 ptr，它这里再进行 & 取地址，相当于最终 Value 内部的 ptr 是指针的指针，即 &&val
+
+因此在 Elem() 内部它会先对 v 的 ptr 进行解引用，即获取指向数据的指针
 
 
-
-具体为什么需要调用 Elem() 去修改 flag 而不能直接在原 Value 上修改，个人推测是这个计算公式的原因，因为 CanSet() 需要判断的不只有 ptr，还有 int 之类的数据类型，而设置 ptr 的 flag = 22 计算后无法等于 flagAddr，因此需要调用 Elem() 进行调整
 
 
 
