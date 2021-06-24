@@ -18,7 +18,8 @@ emmmm，平时也很少接触到高并发，按我本人来讲目前就实习了
 
 ```go
 在看 GMP 调度模型的时候，看到一篇文章讲完 GMP 后说实现一个 goroutine pool，看到我本身也是有兴趣的
-因此打算根据它的部分设计思路+自身学习 Java ThreadPool 的源码逻辑，并且 goroutine pool 是比较考验和运用并发知识的，因此个人认为尝试着手动实现一个 goroutine pool 对我个人而言的能力提升也会是比较明显的
+因此打算根据它的部分设计思路+自身学习 Java ThreadPool 的源码逻辑，并且 goroutine pool 是比较考验和运用并发知识的
+因此个人认为尝试着手动实现一个 goroutine pool 对我个人而言的能力提升也会是比较明显的
 ```
 
 
@@ -490,14 +491,12 @@ Java 的线程有一个抽象的结构体 Thread，我们可以通过操作 Thre
 ```go
 我们需要借助一些特殊的数据结构来控制 goroutine，比如 channel、sync.Cond
 
-这里我们使用 **chan**，利用 chan 的阻塞特性来控制 goroutine，我们利用 chan 来实现任务的传递，goroutine 从 chan 中读取任务，如果没有任务，那么会阻塞，当收到任务后那么就开始执行，执行完成后继续阻塞等待。
+这里我们使用 chan，利用 chan 的阻塞特性来控制 goroutine，我们利用 chan 来实现任务的传递，goroutine 从 chan 中读取任务，如果没有任务，那么会阻塞，当收到任务后那么就开始执行，执行完成后继续阻塞等待。
 
 这里实际上是让 goroutine 不退出 fun() 从而一直运行下去
 
 同时 chan 的阻塞是用户态阻塞，只会阻塞 G，而不会影响到 M，因此 M 可以找其他 G 执行，成本小
 ```
-
-
 
 
 
@@ -997,7 +996,10 @@ getTask() 获取的任务有两种情况：
 
 对于第一种情况，worker 执行任务没有什么问题，因为它此时是不存在于 workers 队列的，即表示它不是一个空闲 worker，那么在任务执行期间 Submit() 后面是不可能再拿到这个 worker 了，因此没问题。
 
-对于第二种情况，worker 执行的任务不是由 Submit() 提交过来的，而是 worker 自己去找的，并且可以看出它在拿到任务后也没有执行从 workers 中脱离的代码，这也就意味着 worker 在执行这个任务的时候，它仍然是在 workers 队列中的，那么下次 Submit() 是有可能把它当作空闲 worker，然后将任务提交给它，而此时它有任务在执行，那么此时 Submit() 就会阻塞住了
+对于第二种情况，worker 执行的任务不是由 Submit() 提交过来的，而是 worker 自己去找的，
+并且可以看出它在拿到任务后也没有执行从 workers 中脱离的代码，
+这也就意味着 worker 在执行这个任务的时候，它仍然是在 workers 队列中的，
+那么下次 Submit() 是有可能把它当作空闲 worker，然后将任务提交给它，而此时它有任务在执行，那么此时 Submit() 就会阻塞住了
 ```
 
 2、**发生 chan 方面的 deadlock**
@@ -1365,7 +1367,7 @@ worker run() 执行逻辑如下：
 解决：
 
 ```go
-因此，现在默认将 workers 队列的 cap 设置为 math.MaxInt32（不提前进行分配），因为 workers 跟任务队列不同，它本身就不应该存在 worker 数限制，限制逻辑需要由 pool 自己去实现。
+因此，现在默认将 workers 队列的 cap 设置为 math.MaxInt32（不提前进行分配）因为 workers 跟任务队列不同，它本身就不应该存在 worker 数限制，限制逻辑需要由 pool 自己去实现。
 不过这实际上使得 workers 里面大部分的逻辑就变得空洞，比如 isFull()，目前仍做保留
 ```
 
