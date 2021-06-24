@@ -748,11 +748,13 @@ pool 关闭需要做以下几件事：
 
 4、清空 workers 队列：将每个 worker 的状态设置为 stop，已经获取到任务或者正在执行会继续执行，执行完成后会自动退出，空闲的 worker 超时等待完成后会退出，将 workers 清空
 
-5、lock.Unlock() 释放锁
+5、关闭 chan
+
+6、lock.Unlock() 释放锁
 
 
 
-## 实现过程中的设计思路、遇到的问题、解决思路
+## 实现过程中的设计思路
 
 
 
@@ -1332,3 +1334,29 @@ worker run() 执行逻辑如下：
 目前超时等待的做法就想到这里
 
 当 pool Close() 时不需要去管 Submit() 阻塞的 goroutine，当到达超时时间自动唤醒发现 pool 已经关闭时它们会自动退出
+
+
+
+
+
+## 遇到的问题、解决思路
+
+> ####  1、workers 队列不能去限制容量 cap
+
+问题：
+
+```go
+在代码中最开始我将 workers 的容量设置为 maxSize，想着最多可以存储 maxSize 个 worker，但是实际上这是存在问题的
+因为对于 stop worker 并不是立马就清除的，而是使用一个 clean goroutine 去执行，这样的话就会导致 实际正在运行的 worker 数小于 maxSize
+因为 stop worker 在没有被清理前，在 Submit() 的视角里所有正在运行的 worker 数是小于 maxSize 的
+因此它可以一个新的 worker，创建完成后它会将该 worker 存放到 workers 队列中
+此时如果 stop worker + running worker 占满了整个队列，那么将会导致这一步阻塞，大大降低了执行效率
+```
+
+解决：
+
+```go
+因此，现在默认将 workers 队列的 cap 设置为 math.MaxInt32（不提前进行分配），因为 workers 跟任务队列不同，它本身就不应该存在 worker 数限制，限制逻辑需要由 pool 自己去实现。
+不过这实际上使得 workers 里面大部分的逻辑就变得空洞，比如 isFull()，目前仍做保留
+```
+
