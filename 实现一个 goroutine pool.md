@@ -1525,6 +1525,44 @@ func main() {
 
 
 
+后续改进：为了防止这种问题而导致一直阻塞，在出现 err 的时候直接 **panic**，这样就能更容易定位问题
+
+```go
+func main() {
+	var sum int32
+	var p = gpool.NewPool2(0, 10, 10, gpool.WithIsBlocking(true),
+		gpool.WithIsPreAllocation(false))
+	//times := 3000
+	times := 10000
+    startTime := time.Now()
+    sum = 0
+    for i := 0; i < times; i++ {
+        wg.Add(1)
+        j := i
+        err := p.Submit(p, func() {
+            add(&sum, int32(j))
+            wg.Done()
+        })
+        if err != nil {
+            fmt.Printf("err：%v, 第 %v 个任务\n", err, i)
+            // 这里直接 panic 终止进程，避免 wg.Wait() 阻塞
+            panic(err)
+        }
+    }
+    wg.Wait()
+    fmt.Println("耗时：", time.Now().Sub(startTime))
+    p.Close()
+    except := getSum(times)
+    fmt.Println("预期 sum 值：", except)
+    fmt.Println("实际 sum 值:", sum)
+    if sum != except {
+        panic(fmt.Errorf("expect:%v, actually:%v", sum, except))
+    }
+}
+```
+
+
+
 ### 问题3
 
 #### 1、问题描述
