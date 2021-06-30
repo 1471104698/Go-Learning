@@ -25,132 +25,21 @@ emmmm，平时也很少接触到高并发，按我本人来讲目前就实习了
 ## 前置知识
 
 ```go
-1、sync.Mutex(sync.Locker 的结构体实现，具有 Lock() 和 UnLock())
-2、sync.WaitGroup
-3、sync.Cond
-4、atomic
-5、channel
-6、time.Ticker、time.Timer
-7、Go 调度模型 GMP
-8、如何控制 goroutine（因为 goroutine 并没有像 Java 那样对线程封装的 Thread 类）
+1、atomic
+2、sync.Mutex(sync.Locker 的结构体实现，具有 Lock() 和 UnLock())
+3、sync.WaitGroup
+4、sync.Cond
+5、sync.Once
+6、sync.RWMutex
+7、channel
+8、time.Ticker、time.Timer
+9、Go 调度模型 GMP
+10、如何控制 goroutine（因为 goroutine 并没有像 Java 那样对线程封装的 Thread 类）
 ```
 
 
 
-### 1、sync.Mutex
-
-sync.Mutex 类似 Java 中的 ReentrantLock，它实现了 sync.Locker 接口
-
-内部维护了一个 state int32 变量，所谓的加锁和解锁都是对这个变量的操作，跟 ReentrantLock 的实现思想基本一致
-
-```go
-// A Locker represents an object that can be locked and unlocked.
-type Locker interface {
-	Lock()
-	Unlock()
-}
-
-type Mutex struct {
-	state int32
-	sema  uint32
-}
-
-func (m *Mutex) Lock() {
-	// Fast path: grab unlocked mutex.
-	if atomic.CompareAndSwapInt32(&m.state, 0, mutexLocked) {
-		if race.Enabled {
-			race.Acquire(unsafe.Pointer(m))
-		}
-		return
-	}
-	// Slow path (outlined so that the fast path can be inlined)
-	m.lockSlow()
-}
-
-func (m *Mutex) Unlock() {
-	if race.Enabled {
-		_ = m.state
-		race.Release(unsafe.Pointer(m))
-	}
-
-	// Fast path: drop lock bit.
-	new := atomic.AddInt32(&m.state, -mutexLocked)
-	if new != 0 {
-		// Outlined slow path to allow inlining the fast path.
-		// To hide unlockSlow during tracing we skip one extra frame when tracing GoUnblock.
-		m.unlockSlow(new)
-	}
-}
-```
-
-
-
-### 2、sync.WaitGroup
-
-sync.WaitGroup 类似 Java 的 CountDownLatch，它是用来使某个 goroutine 等待其他 goroutine 执行完成后才继续执行下去，这段期间会进入阻塞状态
-
-```go
-type WaitGroup struct {
-	noCopy noCopy
-
-	// 64-bit value: high 32 bits are counter, low 32 bits are waiter count.
-	// 64-bit atomic operations require 64-bit alignment, but 32-bit
-	// compilers do not ensure it. So we allocate 12 bytes and then use
-	// the aligned 8 bytes in them as state, and the other 4 as storage
-	// for the sema.
-	state1 [3]uint32
-}
-
-func (wg *WaitGroup) Add(delta int) 
-func (wg *WaitGroup) Done()
-func (wg *WaitGroup) Wait()
-```
-
-可以将 WaitGroup  理解为内部维护了一个计数器 state（内部操作使用 CAS），初始状态计数器值为 0，如果某个 goroutine 调用了 Wait()，那么如果该 goroutine 会进入阻塞状态，直到计数器的值为 0，该 goroutine 继续执行
-
-（由此可以看来该 goroutine 不能先调用 Wait()，需要等待其他 goroutine 调用 Add()，否则一旦调用 Wait() 发现值为 0 了就直接继续执行了，起不到等待的作用）
-
-被等待的线程在执行前调用 Add(1) 将计数器值 +1，在执行完成后调用 Done() 将计数器的值 -1，这样最终计数器的值会回归到 0 的状态，表示所有被等待的 goroutine 执行完成，这样的等待的 goroutine 会被唤醒，继续执行
-
-
-
-### 3、sync.Cond
-
-sync.Cond 类似 Java ReentrantLock 中的 Condition，用于生产者-消费者模式
-
-```go
-type Cond struct {
-	noCopy noCopy
-
-	// L is held while observing or changing the condition
-	L Locker
-
-	notify  notifyList
-	checker copyChecker
-}
-
-// NewCond returns a new Cond with Locker l.
-func NewCond(l Locker) *Cond {
-	return &Cond{L: l}
-}
-
-func (c *Cond) Wait()
-func (c *Cond) Signal()
-func (c *Cond) Broadcast()
-```
-
-它内部维护了 一个 sync.Locker 和 一个等待队列，
-
-它内部维护了三个 API：
-1、Wait()：调用该 API 的 goroutine 会释放锁，然后进入到等待队列中处于自旋或者阻塞状态，等待其他 goroutine 的唤醒。（调用该 API 的前提是当前 goroutine 必须持有锁，即前面已经调用 sync.Locker 的 Lock() 获取锁成功了，否则报错（跟 Condition 一样）。）
-
-2、Signal()：用于唤醒 cond 队列中的一个 goroutine 去获取锁，作用同 Java Condition 的 Signal()（跟 Condition 的区别在于调用该 API 的 goroutine **不需要获取锁**，即任意 goroutine 都可以调用该 API 去唤醒 cond 等待队列中的 goroutine）
-
-3、Broadcast()：用于唤醒 cond 队列中的所有 goroutine 去争夺锁，此时可能出现虚假唤醒，所以注意使用 for 处理，作用同 Java Condition 的 SignalAll()（调用该 API 的 goroutine **不需要获取锁**）
-
-
-
-### 4、atomic
+### 1、atomic
 
 pool 肯定会涉及到变量之类的原子性修改，比如 pool 的当前线程数以及线程的状态等，我们需要利用 atomic 进行 CAS
 
@@ -251,7 +140,276 @@ func CompareAndSwapPointer(addr *unsafe.Pointer, old, new unsafe.Pointer) (swapp
 
 
 
-### 5、chan
+
+
+### 2、sync.Mutex
+
+sync.Mutex 类似 Java 中的 ReentrantLock，它实现了 sync.Locker 接口
+
+内部维护了一个 state int32 变量，所谓的加锁和解锁都是对这个变量的操作，跟 ReentrantLock 的实现思想基本一致
+
+```go
+// A Locker represents an object that can be locked and unlocked.
+type Locker interface {
+	Lock()
+	Unlock()
+}
+
+type Mutex struct {
+	state int32
+	sema  uint32
+}
+
+func (m *Mutex) Lock() {
+	// Fast path: grab unlocked mutex.
+	if atomic.CompareAndSwapInt32(&m.state, 0, mutexLocked) {
+		if race.Enabled {
+			race.Acquire(unsafe.Pointer(m))
+		}
+		return
+	}
+	// Slow path (outlined so that the fast path can be inlined)
+	m.lockSlow()
+}
+
+func (m *Mutex) Unlock() {
+	if race.Enabled {
+		_ = m.state
+		race.Release(unsafe.Pointer(m))
+	}
+
+	// Fast path: drop lock bit.
+	new := atomic.AddInt32(&m.state, -mutexLocked)
+	if new != 0 {
+		// Outlined slow path to allow inlining the fast path.
+		// To hide unlockSlow during tracing we skip one extra frame when tracing GoUnblock.
+		m.unlockSlow(new)
+	}
+}
+```
+
+
+
+### 3、sync.WaitGroup
+
+sync.WaitGroup 类似 Java 的 CountDownLatch，它是用来使某个 goroutine 等待其他 goroutine 执行完成后才继续执行下去，这段期间会进入阻塞状态
+
+```go
+type WaitGroup struct {
+	noCopy noCopy
+
+	// 64-bit value: high 32 bits are counter, low 32 bits are waiter count.
+	// 64-bit atomic operations require 64-bit alignment, but 32-bit
+	// compilers do not ensure it. So we allocate 12 bytes and then use
+	// the aligned 8 bytes in them as state, and the other 4 as storage
+	// for the sema.
+	state1 [3]uint32
+}
+
+func (wg *WaitGroup) Add(delta int) 
+func (wg *WaitGroup) Done()
+func (wg *WaitGroup) Wait()
+```
+
+可以将 WaitGroup  理解为内部维护了一个计数器 state（内部操作使用 CAS），初始状态计数器值为 0，如果某个 goroutine 调用了 Wait()，那么如果该 goroutine 会进入阻塞状态，直到计数器的值为 0，该 goroutine 继续执行
+
+（由此可以看来该 goroutine 不能先调用 Wait()，需要等待其他 goroutine 调用 Add()，否则一旦调用 Wait() 发现值为 0 了就直接继续执行了，起不到等待的作用）
+
+被等待的线程在执行前调用 Add(1) 将计数器值 +1，在执行完成后调用 Done() 将计数器的值 -1，这样最终计数器的值会回归到 0 的状态，表示所有被等待的 goroutine 执行完成，这样的等待的 goroutine 会被唤醒，继续执行
+
+
+
+### 4、sync.Cond
+
+sync.Cond 类似 Java ReentrantLock 中的 Condition，用于生产者-消费者模式
+
+```go
+type Cond struct {
+	noCopy noCopy
+
+	// L is held while observing or changing the condition
+	L Locker
+
+	notify  notifyList
+	checker copyChecker
+}
+
+// NewCond returns a new Cond with Locker l.
+func NewCond(l Locker) *Cond {
+	return &Cond{L: l}
+}
+
+func (c *Cond) Wait()
+func (c *Cond) Signal()
+func (c *Cond) Broadcast()
+```
+
+它内部维护了 一个 sync.Locker 和 一个等待队列，
+
+它内部维护了三个 API：
+1、Wait()：调用该 API 的 goroutine 会释放锁，然后进入到等待队列中处于自旋或者阻塞状态，等待其他 goroutine 的唤醒。（调用该 API 的前提是当前 goroutine 必须持有锁，即前面已经调用 sync.Locker 的 Lock() 获取锁成功了，否则报错（跟 Condition 一样）。）
+
+2、Signal()：用于唤醒 cond 队列中的一个 goroutine 去获取锁，作用同 Java Condition 的 Signal()（跟 Condition 的区别在于调用该 API 的 goroutine **不需要获取锁**，即任意 goroutine 都可以调用该 API 去唤醒 cond 等待队列中的 goroutine）
+
+3、Broadcast()：用于唤醒 cond 队列中的所有 goroutine 去争夺锁，此时可能出现虚假唤醒，所以注意使用 for 处理，作用同 Java Condition 的 SignalAll()（调用该 API 的 goroutine **不需要获取锁**）
+
+
+
+### 5、sync.Once
+
+sync.Once 能够用来控制某个 func() 只执行一次，并且保证并发安全，可以用来实现单例获取或者某个 func() 的只需要一次执行的情况
+
+
+
+> #### 例子
+
+```go
+func main() {
+	o := sync.Once{}
+	wg := sync.WaitGroup{}
+	for i := 0; i < 1000; i++ {
+		wg.Add(1)
+		j := i
+		go func() {
+			o.Do(func() {
+				fmt.Println(j)
+			})
+			wg.Done()
+		}()
+	}
+	wg.Wait()
+}
+```
+
+输出结果：
+
+```go
+0
+```
+
+这个输出的数可以是 [0, 999] 之间的任何数，但是永远只会输出一个数字，即这个 println 只会执行一次
+
+
+
+> #### sync.Once 结构体
+
+```go
+type Once struct {
+	done uint32
+	m    Mutex
+}
+```
+
+它内部维护了一个 uint32 类型的 done 变量和一把互斥锁
+
+
+
+> #### Once 的 Do()
+
+```GO
+func (o *Once) Do(f func()) {
+    
+    //  if atomic.CompareAndSwapUint32(&o.done, 0, 1) {
+	//		f()
+	//	}
+    // 这里作者声明不直接使用 CAS 来替换的原因是这种做法无法让 CAS 失败的 goroutine 去等待 f 执行完成就直接返回了
+    // 比如同时来两个 goroutine，CAS 只有一个 goroutine 能够成功，此时对于 CAS 成功的 goroutine 会调用 doSlow() 去执行 f
+    // 对于 CAS 失败的 goroutine 会直接返回，它还没有等待 f 执行完成就返回了，这可能违背了作者的意愿
+    // 作者的意愿大概是要让进入 Do() 的所有 goroutine 在从该函数 return 的时候 f 就已经执行完毕了，所以这里不使用 CAS
+    // 这也是 doSlow() 要求 done + 1 必须在 f() 执行完成之后
+    // 否则还没执行完成就 done + 1那么未执行或者执行过程中来了一个新的 goroutine，发现 atomic.LoadUint32(&o.done) != 0 就直接 return 了
+    
+    // atomic 原子判断是否已经执行过了, done == 0 表示没有执行过
+	if atomic.LoadUint32(&o.done) == 0 {
+        // 执行
+		o.doSlow(f)
+	}
+}
+
+func (o *Once) doSlow(f func()) {
+    // 典型的双重检查，因为外部使用的是 LoadUint32 而不是 CAS，因此可能同一时间有两个 goroutine 进入到 doSlow
+    // 此时只有一个 goroutine 会获取到锁，其他的 goroutine 会阻塞在 Lock()
+    // 获取到锁的 goroutine 执行完成后，将 done + 1，释放锁，此时阻塞的 goroutine 获取锁
+    // 如果此时没有再进行 o.done == 0 的判断，那么会导致再次执行一遍，因此这里在判断一次能够有效避免 f 的多次执行
+	o.m.Lock()
+	defer o.m.Unlock()
+    // 判断是否已经执行过了， done != 0 表示已经执行过了
+	if o.done == 0 {
+        // 延迟将 done+1，在 f 函数执行完成之后
+        //（不知道为什么这里加锁了还需要使用 atomic，而不是直接使用 done + 1，是因为直接 done + 1 不会刷新 CPU cache ？不太清楚，目前没找到解释）
+		defer atomic.StoreUint32(&o.done, 1)
+        // 执行目标函数
+		f()
+	}
+}
+```
+
+
+
+### 6、sync.RWMutex
+
+sync.RWMutex 是一把读写锁，写的优先级比读的优先级高
+
+当有 goroutine 已经获取读锁时，那么后续获取写锁的 goroutine 阻塞，后续获取读锁的 goroutine 正常获取，获取读锁的 goroutine 计数+1
+
+当有 goroutine 已经获取写锁时，那么后续获取读锁和写锁的 goroutine 都阻塞
+
+
+
+> #### 死锁例子
+
+读写锁都有一个很典型的死锁问题
+
+使用读写锁时如果不注意锁的获取顺序，那么可能会导致死锁
+
+比如 goroutine A 获取了读锁，然后 goroutine B 尝试获取写锁，阻塞了，此时如果 goroutine  A 再次要获取读锁，由于 goroutine A 前面还有一个 goroutine B  在等待获取写锁，那么此时 goroutine A 也会阻塞，这就导致 goroutine A 和 goroutine B 陷入死锁
+
+```go
+var rwLock = sync.RWMutex{}
+
+func main() {
+	wg := sync.WaitGroup{}
+	wg.Add(2)
+	go func() {
+		read()
+		wg.Done()
+	}()
+	go func() {
+		write()
+		wg.Done()
+	}()
+	wg.Wait()
+}
+
+func read() {
+	rwLock.RLock()
+	fmt.Println("read lock get success")
+    // 休眠 3ms，让另一个 goroutine 获取写锁 
+	time.Sleep(3 * time.Millisecond)
+	rwLock.RLock()
+	fmt.Println("read lock get success again")
+}
+
+func write() {
+    // 休眠 1ms，让另一个 goroutine 先获取读锁
+	time.Sleep(time.Millisecond)
+	rwLock.Lock()
+	fmt.Println("write lock get success")
+}
+
+```
+
+输出结果：
+
+```go
+fatal error: all goroutines are asleep - deadlock!
+```
+
+
+
+
+
+### 7、chan
 
 chan 全称为 channel，意为管道，它是 goroutine 通信的一种方式，同时也是**并发安全**的
 
@@ -411,9 +569,74 @@ func main() {
 
 
 
+> #### select 和 nil 的 chan 
+
+select 的 case 是可以处理 nil 的 chan 的
+
+```go
+func main() {
+	var ch chan int
+	select {
+	case <-ch:
+		fmt.Println("ch")
+	case <-time.After(time.Millisecond):
+		fmt.Println("timeout")
+	}
+}
+```
+
+输出结果：
+
+```go
+timeout
+```
 
 
-### 6、time.Timer、time.Ticker
+
+> #### chan 关闭问题
+
+如果关闭已经关闭过的 chan，那么会导致 panic
+
+```go
+func main() {
+	ch := make(chan int)
+	close(ch)
+	close(ch)
+}
+```
+
+```go
+panic: close of closed channel
+```
+
+
+
+因此为了防止在并发的时候多个 goroutine 多次关闭 chan，可以使用 sync.Once 来控制
+
+```go
+type Chan struct {
+	ch chan int
+	o  sync.Once
+}
+
+func (ch *Chan) Close() {
+	ch.o.Do(func() {
+		close(ch.ch)
+	})
+}
+func main() {
+	ch := Chan{
+		ch: make(chan int),
+		o:  sync.Once{},
+	}
+	ch.Close()
+	ch.Close()
+}
+```
+
+
+
+### 8、time.Timer、time.Ticker
 
 golang 的定时任务需要涉及到 time，而 time 提供了两种定时任务方式：
 
@@ -466,7 +689,11 @@ func main() {
 
 
 
-### 7、Go 调度模型-GMP
+
+
+
+
+### 9、Go 调度模型-GMP
 
 这个的话在这里进行了整理
 
@@ -474,13 +701,13 @@ https://github.com/1471104698/GoLearning/blob/master/GO%20%E8%B0%83%E5%BA%A6.md
 
 
 
-### 8、如何控制 goroutine
+### 10、如何控制 goroutine
+
+pool 实现的一个核心就是需要能够控制 goroutine，以此来复用 goroutine，减少 goroutine 的创建和销毁
 
 Java 的线程有一个抽象的结构体 Thread，我们可以通过操作 Thread 的 API 来操作这个线程，以此来控制 Thread 的生命周期
 
-但是 Go  的线程单单只是对外暴露了一个关键字 `go`，没有提供一个抽象的实体，因此不能跟 Java 一样那样直接去控制
-
-而 pool 实现的一个核心就是需要能够控制 goroutine，以此来复用 goroutine，减少 goroutine 的创建和销毁
+但是 Go  的线程单单只是对外暴露了一个关键字 `go`，没有提供一个抽象的实体，**但实质上都是一样的**，Java Thread 的生命周期是 run()，一旦跳出 run() 那么该线程就结束运行，go 也一样，一旦 go func() 对应的 func()  return 了，那么该 goroutine 也结束运行，因此可以通过控制 func() 的生命周期来控制 goroutine
 
 
 
