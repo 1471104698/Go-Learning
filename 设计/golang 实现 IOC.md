@@ -306,9 +306,13 @@ type People struct {
 }
 ```
 
-上面每个变量右边的 ``json:"age", bson:"age"` 就是一个 tag，我们可以通过 `reflect.TypeOf().Field().Tag` 来获取变量 field 的 Tag，然后通过判断 Tag 是否存在对应的注入注解来判断该 field 是否需要注入
+上面每个变量右边的 ``json:"age", bson:"age"` 就是一个 tag，我们可以通过 `reflect.TypeOf().Field().Tag` 来获取变量 field 的 Tag，然后通过判断 Tag  来判断 bean 的注入情况
 
-我们可以设置注入的注解为 `di`：
+
+
+> #### 设计一
+
+设置注入的注解为 `di`，标识注入的 bean 的类型，通过 `beanName` 选择注入特定的 bean：
 
 ```go
 type A struct {
@@ -336,6 +340,34 @@ func main() {
         // 注入逻辑
         // ....
     }
+}
+```
+
+
+
+> #### 设计二
+
+这种设计跟 Spring IOC 一样，所有的 bean 都在 Spring 初始化的时候加载完毕，然后 bean 注入只能选择注入哪个 beanName 的 bean，不能选择注入的 bean 类型，`di` 注解值就是指定注入的 beanName，如果没有指定值，那么从已经加载的 bean 中找到相同类型的 bean 选择一个注入
+
+这里作用同 @Autowired + @Qualifier
+
+```go
+type A struct {
+	B *B `di:""`
+}
+
+type B struct {
+	name string
+	age  int
+	C    *C `di:"c"`
+	A    *A `di:"a"`
+}
+
+type C struct {
+	i    int
+	b    bool
+	name string
+	A    *A `di:"a"`
 }
 ```
 
@@ -463,7 +495,7 @@ func (ioc *IOC) GetBeanFactory() BeanFactory
 
 
 
-## 7、bean 注册/获取过程
+## 7、bean 注册/获取过程（设计一）
 
 bean 注册代码：
 
@@ -666,7 +698,7 @@ doCreateBean() 大致逻辑如下：
 
 
 
-## 8、属性注入
+## 8、属性注入（设计一）
 
 processPropertyValues() 属性注入代码如下：
 
@@ -830,15 +862,19 @@ func (bc *BeanBeanFactory) getSingleton(beanName string, allowEarlyReference boo
 
 ## 11、后记
 
-这次 IOC 的实现是根据之前阅读过的 Spring IOC 源码来实现的简化版，实现过程也比较顺利，没有遇到过太多的问题，遇到的一些问题也能在比较短的时间内解决，大部分是反射方面的问题
+IOC 的实现是跟在 goroutine pool 之后，所一些接口之类的设计会跟 goroutine pool 有点相像。
 
-IOC 的结构也改了好几次，不过这里没说明出修改的设计思路，具体可以看 github 的提交 commit
+这次 IOC 的实现是根据之前阅读过的 Spring IOC 源码来实现的简化版，实现过程也比较顺利，没有遇到过太多的问题，遇到的一些问题也能在比较短的时间内解决，大部分是反射方面的问题，golang 反射的使用比 Java 难很多，坑点也比 Java 的多很多，经过这次设计让自己对 golang 反射也更加的熟练。
 
-IOC 目前的问题：
+IOC 的结构也改了好几次，不过这里没说明出修改的设计思路，具体可以看 github 的提交 commit。
+
+
+
+当前设计的 IOC 存在的问题：
 
 ```go
 1、没有实现 AOP 和 解决多 groutine 的并发问题
 
-2、由于 golang 本身是值传递，所以实际上如果需要注入一个非 ptr 类型的结构体，并且设置为 singleton 类型的，看着是单例，但是是实际上返回的 bean 是存储的 bean 的副本，因此对于非 ptr 的结构体 singleton 没有什么意义
+2、目前 IOC 支持 singleton 的非 ptr 结构体注入，然而 golang 本身是值传递，所以如果需要注入一个 singleton 的 非 ptr 类型的结构体，实际上返回的 bean 是存储的 bean 的副本，因此对于非 ptr 的结构体设置为 singleton 在实际上并没有什么意义。
 ```
 
