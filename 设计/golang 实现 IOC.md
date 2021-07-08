@@ -495,7 +495,7 @@ func (ioc *IOC) GetBeanFactory() BeanFactory
 
 
 
-## 7、bean 注册/获取过程（设计一）
+## 7、bean 注册/获取过程
 
 bean 注册代码：
 
@@ -698,7 +698,9 @@ doCreateBean() 大致逻辑如下：
 
 
 
-## 8、属性注入（设计一）
+## 8、属性注入
+
+> #### 设计一
 
 processPropertyValues() 属性注入代码如下：
 
@@ -715,6 +717,10 @@ func (bp *PopulateBeanProcessor) processPropertyValues(wrapBean reflect.Value, t
 		if ftPtr.Kind() == reflect.Ptr {
 			ft = ftPtr.Elem()
 		} else {
+			// 不允许非 ptr 结构体注入
+			if !bp.bc.isAllowPopulateStructBean() {
+				continue
+			}
 			ft = ftPtr
 		}
 		// 非 wrapBean，那么直接跳过
@@ -757,19 +763,89 @@ func (bp *PopulateBeanProcessor) processPropertyValues(wrapBean reflect.Value, t
 processPropertyValues() 大致逻辑如下：
 1、扫描所有的 field
 
-2、划分当前 field 的  tPtr 和 t
+2、划分当前 field 的  tPtr 和 t，同时如果 field 是非 ptr 结构体，那么判断是否允许非 ptr 结构体注入
 
 3、判断当前 field 是否能够作为一个 bean，如果不能那么跳过
 
-4、获取当前 field 的 beanType，判断是否非法，如果非法那么跳过
+4、**获取当前 field 的 beanType，判断是否非法，如果非法那么跳过**
 
-5、获取当前 field t 对应的 beanName，判断当前 field 对应的 beanName 是否已经注册，如果没有注册那么表示不存在那么将当前 tPtr 进行注册
+5、**获取当前 field t 对应的 beanName，判断当前 field 对应的 beanName 是否已经注册，如果没有注册那么表示不存在那么将当前 tPtr 进行注册**
 
 6、调用 GetBean() 走 container 的获取逻辑，自动根据 beanType 进行不同逻辑的获取
 
 7、将返回的 bean 封装为 reflect.Value，调用 Set() 进行注入
 
 reflect.Value 对于传入的值维护的都是指针，因此这里 Set() 是能够影响到原值的
+
+
+
+> #### 设计二
+
+processPropertyValues() 属性注入代码如下：
+
+```go
+// processPropertyValues 属性注入
+func (bp *PopulateBeanProcessor) processPropertyValues(wrapBean reflect.Value, t reflect.Type) {
+	// 扫描所有的 field
+	for i := 0; i < t.NumField(); i++ {
+		field := t.Field(i)
+		// field 的 reflect.Type 类型信息
+		ftPtr := field.Type
+		// field 的 非 ptr type
+		var ft reflect.Type
+		if ftPtr.Kind() == reflect.Ptr {
+			ft = ftPtr.Elem()
+		} else {
+			// 不允许非 ptr 结构体注入，那么直接跳过该 field
+			if !bp.bc.isAllowPopulateStructBean() {
+				continue
+			}
+			ft = ftPtr
+		}
+		// 非 bean，那么直接跳过
+		if !isBean(ft) {
+			continue
+		}
+		// 获取 field 注入的 bean 的 beanName
+		fieldBeanName := bp.getFieldBeanName(field, ftPtr, ft)
+		// beanName 不存在，报错
+		if fieldBeanName == "" {
+			panic(fmt.Errorf("field bean %v is not exist", field.Name))
+		}
+		// 调用 GetBean() 获取 field bean，走 container 的逻辑
+		fieldBean := bp.bc.GetBean(fieldBeanName)
+		// 将 bean 封装为 reflect.Value，用于 set()
+		fieldBeanValue := reflect.ValueOf(fieldBean)
+		// 将 field bean 赋值给 bean
+		if ft == ftPtr {
+			// field 非 ptr，那么直接设置即可
+			wrapBean.Field(i).Set(fieldBeanValue)
+		} else {
+			// field ptr，那么需要 fieldBean 是 ptr bean，这里需要先进行 Elem()，然后 Addr() 返回地址，赋值给 field
+			wrapBean.Field(i).Set(fieldBeanValue.Elem().Addr())
+		}
+	}
+}
+```
+
+processPropertyValues() 大致逻辑如下：
+1、扫描所有的 field
+
+2、划分当前 field 的  tPtr 和 t，同时如果 field 是非 ptr 结构体，那么判断是否允许非 ptr 结构体注入
+
+3、判断当前 field 是否能够作为一个 bean，如果不能那么跳过
+
+4、**获取 beanName，这里是根据 DI 注解进行获取，如果存在 DI 注解但是没有具体的值，那么从已经注册的 bean 中获取相同类型的 bean，再获取对应的 beanName**
+
+5、**如果 beanName == ""，表示该 field 没有注册，那么 panic，注入失败**
+
+6、调用 GetBean() 走 container 的获取逻辑，自动根据 beanType 进行不同逻辑的获取
+
+7、将返回的 bean 封装为 reflect.Value，调用 Set() 进行注入
+
+reflect.Value 对于传入的值维护的都是指针，因此这里 Set() 是能够影响到原值的
+
+
 
 
 
