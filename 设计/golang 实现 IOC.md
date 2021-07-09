@@ -936,7 +936,98 @@ func (bc *BeanBeanFactory) getSingleton(beanName string, allowEarlyReference boo
 
 
 
-## 11、后记
+## 11、遇到的问题以及解决
+
+> #### 问题一
+
+循环依赖中 struct 注入的问题
+
+有以下结构体：
+
+```go
+type A struct {
+	B *B `di:""`
+}
+
+type B struct {
+	name string
+	age  int
+	C    *C `di:"c"`
+	A    *A `di:"a"`
+}
+
+type C struct {
+	i    int
+	b    bool
+	name string
+	A    A `di:"a"`
+}
+```
+
+上面的结构体中存在循环依赖：A -> B -> C -> A，而 C 中依赖的 A 是 struct bean
+
+```go
+func main() {
+	opts := []gioc.Option{
+		gioc.WithAllowEarlyReference(true),
+		gioc.WithAllowPopulateStructBean(true),
+	}
+	ioc := gioc.NewIOC(opts...)
+	// 这里在 Spring 中应该是由 Spring 扫描类路径然后获取 @Component 或者 @Import 注解的类的信息然后再注册的，我这里省去了扫描的过程，直接构建注册
+	classA := gioc.NewClass("a", (*A)(nil), gioc.Singleton)
+	classB := gioc.NewClass("bbbb", (*B)(nil), gioc.Singleton)
+	classC := gioc.NewClass("c", (*C)(nil), gioc.Singleton)
+	_ = ioc.Register(classA)
+	_ = ioc.Register(classB)
+	_ = ioc.Register(classC)
+	bean := ioc.GetBean("a").(*A)
+	fmt.Println(bean)
+}
+```
+
+我们获取 A bean，它在创建的过程中会去创建 B，然后会再去创建 C，C 会再去创建 A，第二次调用创建 A 的过程中，会从三级缓存中获取到 A，此时的 A 是一个半成品，由于 C 要求的是一个 struct bean，因此 C 注入的是 struct bean，它是正在创建的 A 的副本，因此当 A 创建完成后不会影响到副本，C 中注入的 A 也仍然是一个半成品，最终返回的 bean 中 C 的内容如下：
+
+![image.png](https://pic.leetcode-cn.com/1625847196-UjQLHS-image.png)
+
+> #### 解决
+
+鉴于注入的 struct bean 都是一个副本，因此这里判断如果注入的是 struct bean，那么直接创建一个新的 bean，不使用原有的 bean
+
+```go
+// processPropertyValues 属性注入
+func (bp *PopulateBeanProcessor) processPropertyValues(wrapBean reflect.Value, t reflect.Type) {
+	// 扫描所有的 field
+	for i := 0; i < t.NumField(); i++ {
+		// ...
+        
+		// 调用 GetBean() 获取 field bean，走 container 的逻辑
+		var fieldBean interface{}
+		// 如果是 struct bean，那么不使用旧的 bean，直接获取一个新的 bean
+		if isStructBean(ftPtr, ft) {
+			fieldBean = bp.bc.GetNewBean(fieldBeanName)
+		} else {
+			fieldBean = bp.bc.GetBean(fieldBeanName)
+		}
+		// ...
+	}
+}
+
+// createBean 创建 bean 实例
+func (bc *BeanBeanFactory) createBean(beanName string, beanType BeanType, new bool) interface{} {
+    // 判断是否是需要创建新的 bean，如果是的话那么不进行前置检查
+	if !new {
+		// bean 创建的前置处理
+		bc.createBefore(beanName, beanType)
+		// bean 创建完毕的后置处理
+		defer bc.createAfter(beanName, beanType)
+	}
+	// ...
+}
+```
+
+
+
+## 12、后记
 
 IOC 的实现是跟在 goroutine pool 之后，所一些接口之类的设计会跟 goroutine pool 有点相像。
 
@@ -946,11 +1037,5 @@ IOC 的结构也改了好几次，不过这里没说明出修改的设计思路�
 
 
 
-当前设计的 IOC 存在的问题：
-
-```go
-1、没有实现 AOP 和 解决多 groutine 的并发问题
-
-2、目前 IOC 支持 singleton 的非 ptr 结构体注入，然而 golang 本身是值传递，所以如果需要注入一个 singleton 的 非 ptr 类型的结构体，实际上返回的 bean 是存储的 bean 的副本，因此对于非 ptr 的结构体设置为 singleton 在实际上并没有什么意义。
-```
+当前设计的 IOC 存在的不足：**没有实现 AOP 和 解决多 groutine 的并发问题**
 
