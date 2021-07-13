@@ -48,6 +48,8 @@ type hmap struct {
 
 > #### mapextra 结构
 
+hamp 中有 buckets 和 oldbuckets， mapextra 中有 overflow 和 oldoverflow，其中 buckets 和 overflow 是一般情况下用来存储数据的，而 oldbuckets 和 oldoverflow 只有在扩容的时候才会用到，在平时为 nil，这里的操作实际上跟 redis 的 dict 设计是一样的。
+
 ```go
 // mapextra holds fields that are not present on all maps.
 type mapextra struct {
@@ -116,6 +118,51 @@ int8 占 1B，对齐保证为 1B，地址偏移量必须是 1 的整数倍
 
 
 
+### map 的 bucket 等结构都是存储内存地址指针，如何查找指定位置的 bucket？
+
+首先我们需要知道：在编译期间，编译器会进行一些加料操作，它会计算出 bucket、key、value 对应类型的占用内存大小，存储到变量 bucketSize、keySize、elemSize 中
+
+
+
+bucket 的查找
+
+```go
+假设我们要查找第 i 个 bucket，一般情况下我们是 buckets[i]，但是这里存储的是指针 unsafe.Pointer
+它指向的是 buckets 的基地址，那么我们只需要计算第 i 个 bucket 的偏移量，然后加上这个基地址即可得到第 i 个 bucket 的内存地址指针
+
+// unsafe.Pointer 是一个通用型指针，它可以转换为 uintptr 和 任何类型的指针，但是它无法进行地址运算，需要先转换为 uintptr 才能进行地址运算
+// 这里先将 bucketSize 转换成 uintptr 类型（uintptr 可以和任何整型类型相互转换），再将 unsafe.Pointer 类型的 buckets 转换为 uintptr
+// 两者相加即可得到第 i 个 bucket 的 uinptr 内存地址，然后再转换为 unsafe.Pointer，再转换为 *bmap 即可得到第 i 个 bucket
+b := (*bmap)(unsafe.Pointer(uintptr(h.buckets) +  i*uintptr(t.bucketsize)))
+```
+
+
+
+key 的查找
+
+```go
+原理同 bucket 的查找，不过 key 存储在 bmap 上，key-value 是分开存储的，因此 key 在内存中的结构为 key1/key2/key3/...
+同样只需要计算出 tophash 的内存占用 + keys 基地址 即可，根据 bmap 的内存结构，keys 前面还存在 tophash[8]，因此 keys 的基地址是在 tophash 之后的，因此我们需要计算出 tophash 占用的内存大小，然后这之间可能由于内存对齐规则需要 padding
+在 map 中使用了一个 dataOffset 字段来表示 tophash 的内存占用 + padding
+因此 keys 的地址偏移量为 dataOffset，因此 第 i 个 key 的内存地址为 uintptr(b) + dataOffset + i*(uintptr(t.keySize))
+```
+
+
+
+value 的查找
+
+```go
+value 查找跟 key 的查找类似，不过 value 前面需要先计算 tophash 和 keys 占用的内存大小，以此来得到 values 的基地址
+tophash 占用内存大小为 dataOffset，一个 bucket 的 keys 数量 bucketCnt = 8，那么整个 keys 占用内存大小为 bucketCnt*(uintptr(t.keySize))
+
+那么第 i 个 value 的内存地址为
+uintptr(b) + dataOffset + bucketCnt*(uintptr(t.keySize)) + i*(uintptr(t.elemSize))
+```
+
+
+
+
+
 ## 2、bmap tophash 的作用
 
 tophash 是用来标识当前 bucket 中每个位置的状态的，其取值如下：
@@ -161,7 +208,7 @@ func tophash(hash uintptr) uint8 {
 
 > #### 1、emptyRest
 
-表示当前位置以及后面的位置都是可用的
+表示当前位置以及后面的位置都是可用的，这里的后面包括后面链接的所有的 overflow 都是可用的
 
 
 
@@ -573,7 +620,6 @@ bucketloop:
 		elem = add(insertk, bucketCnt*uintptr(t.keysize))
 	}
 
-	// store new key/elem at insert position
 	if t.indirectkey() {
 		kmem := newobject(t.key)
 		*(*unsafe.Pointer)(insertk) = kmem
@@ -588,10 +634,7 @@ bucketloop:
 	h.count++
 
 done:
-	if h.flags&hashWriting == 0 {
-		throw("concurrent map writes")
-	}
-	h.flags &^= hashWriting
+    // 到这里是已经插入/更新完成了，elem 是 value 插入/更新的内存地址，这里判断 value 是否是指针封装，如果是那么引用，然后 return
 	if t.indirectelem() {
 		elem = *((*unsafe.Pointer)(elem))
 	}
@@ -630,3 +673,73 @@ func tooManyOverflowBuckets(noverflow uint16, B uint8) bool {
 	return noverflow >= uint16(1)<<(B&15)
 }
 ```
+
+
+
+hashGrow() 设置扩容条件
+
+hashGrow() 并不会真正执行扩容逻辑，而是单纯把扩容所需的一些条件给设置好：
+
+1、将 buckets 赋值为 oldbuckets，创建一个新的 buckets，将新的 buckets 赋值给 buckets
+
+2、将 overflow 赋值给 oldoverflow，然后 overflow 置 nil，oldoverflow 里面的元素在扩容迁移的时候会迁移到新的 buckets 里，所以无需担心
+
+```go
+func hashGrow(t *maptype, h *hmap) {
+	// If we've hit the load factor, get bigger.
+	// Otherwise, there are too many overflow buckets,
+	// so keep the same number of buckets and "grow" laterally.
+    
+    // 判断是等量扩容还是增量扩容
+    // 首先 bigger = 1，如果是增量扩容，那么 B + bigger = B + 1，相当于容量翻倍
+    // !overLoadFactor() 成立，那么表示进入到该方法不是因为 count 过多超过了装载因子的界限，而是因为 overflow 太多，那么设置为等量扩容，bigger = 0
+	bigger := uint8(1)
+	if !overLoadFactor(h.count+1, h.B) {
+		bigger = 0
+		h.flags |= sameSizeGrow
+	}
+    // 将当前 buckets 赋值给 oldbuckets（oldbuckets != nil 表示当前正在扩容）
+	oldbuckets := h.buckets
+    // 重新创建一个新的 buckets 作为 newbuckets
+	newbuckets, nextOverflow := makeBucketArray(t, h.B+bigger, nil)
+
+	flags := h.flags &^ (iterator | oldIterator)
+	if h.flags&iterator != 0 {
+		flags |= oldIterator
+	}
+	// commit the grow (atomic wrt gc)
+    // 更新 B
+	h.B += bigger
+	h.flags = flags
+    // 设置 oldbuckets
+	h.oldbuckets = oldbuckets
+    // 更新 buckets 为新的 buckets
+	h.buckets = newbuckets
+    // 设置下一个待迁移的 bucket 索引（索引位置小于该值的 bucket 都已经迁移完成）
+	h.nevacuate = 0
+    // 设置 overflow 数量为 0
+	h.noverflow = 0
+
+	if h.extra != nil && h.extra.overflow != nil {
+		// Promote current overflow buckets to the old generation.
+		if h.extra.oldoverflow != nil {
+			throw("oldoverflow is not nil")
+		}
+        // 将当前 map 的 overflow 列表赋值给 oldoverflow，在扩容的时候会将 oldoverflow 中的元素迁移到新 buckets
+        // 这里也可以看出将 overflow 单独提出来作为一个集合是为了这里方便统一处理
+		h.extra.oldoverflow = h.extra.overflow
+        // 将 overflow 设置为 nil，在后续的时候再重新创建
+		h.extra.overflow = nil
+	}
+	if nextOverflow != nil {
+		if h.extra == nil {
+			h.extra = new(mapextra)
+		}
+		h.extra.nextOverflow = nextOverflow
+	}
+
+	// the actual copying of the hash table data is done incrementally
+	// by growWork() and evacuate().
+}
+```
+
