@@ -605,21 +605,31 @@ bucketloop:
         // 将 b 设置为 overflow
 		b = ovf
 	}
+    
+    // 在已有的 bucket 和 overflow 中没有找到对应的 key 并且所有的桶都已经满了，那么会触发以下两种情况：
 
-	// 当前没有在扩容并且 key-value 个数超过了装载因子*桶个数，或者 存在太多的 overflow，那么进行等位迁移
+    // 情况一：
+	// 当前没有在扩容并且 key-value 个数超过了装载因子*桶个数，或者 存在太多的 overflow，那么进行扩容条件设置（注意并不执行扩容逻辑）
+    // 扩容设置完成后会重新进行查找
 	if !h.growing() && (overLoadFactor(h.count+1, h.B) || tooManyOverflowBuckets(h.noverflow, h.B)) {
 		hashGrow(t, h)
+        // 重新进行查找
 		goto again // Growing the table invalidates everything, so try again
 	}
 
-    // 
+    // 情况二：
+    // 不需要扩容，并且 inserti == nil，表示 bucket 和 overflow 都已经满了，那么这里创建一个新的 overflow 来存放 key
 	if inserti == nil {
+        // 创建一个新的 overflow
 		newb := h.newoverflow(t, b)
 		inserti = &newb.tophash[0]
+        // 插入的 key 位置为索引位置为 0 的 key
 		insertk = add(unsafe.Pointer(newb), dataOffset)
-		elem = add(insertk, bucketCnt*uintptr(t.keysize))
+		// value 同理
+        elem = add(insertk, bucketCnt*uintptr(t.keysize))
 	}
-
+	
+    // 下面都是插入逻辑了
 	if t.indirectkey() {
 		kmem := newobject(t.key)
 		*(*unsafe.Pointer)(insertk) = kmem
@@ -631,6 +641,7 @@ bucketloop:
 	}
 	typedmemmove(t.key, insertk, key)
 	*inserti = top
+    // 元素个数+1
 	h.count++
 
 done:
@@ -684,6 +695,8 @@ hashGrow() 并不会真正执行扩容逻辑，而是单纯把扩容所需的一
 
 2、将 overflow 赋值给 oldoverflow，然后 overflow 置 nil，oldoverflow 里面的元素在扩容迁移的时候会迁移到新的 buckets 里，所以无需担心
 
+hashGrow() 设置完扩容条件后就直接返回了，当 插入、删除 或者 查询的时候发现 oldbuckets != nil，那么就会进行协助扩容
+
 ```go
 func hashGrow(t *maptype, h *hmap) {
 	// If we've hit the load factor, get bigger.
@@ -696,6 +709,7 @@ func hashGrow(t *maptype, h *hmap) {
 	bigger := uint8(1)
 	if !overLoadFactor(h.count+1, h.B) {
 		bigger = 0
+        // 标识当前扩容为等量扩容
 		h.flags |= sameSizeGrow
 	}
     // 将当前 buckets 赋值给 oldbuckets（oldbuckets != nil 表示当前正在扩容）
@@ -742,4 +756,10 @@ func hashGrow(t *maptype, h *hmap) {
 	// by growWork() and evacuate().
 }
 ```
+
+
+
+## 8、map 遍历无序
+
+map 的遍历是无序的，这是 golang 开发者故意为之
 
