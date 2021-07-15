@@ -763,3 +763,47 @@ func hashGrow(t *maptype, h *hmap) {
 
 map 的遍历是无序的，这是 golang 开发者故意为之
 
+由于 map 扩容的时候会改变一个元素的存储位置，因此可能会发生第一次遍历跟第二次遍历得到的结果顺序不一致的情况
+
+因此为了避免用户依赖结果顺序而导致出现错误，golang 开发者直接在遍历的时候加入随机性，使得每次遍历得到的结果都是无序的
+
+![4538693e00e97e1baf1bb5e0462deb48.png](https://img-blog.csdnimg.cn/img_convert/4538693e00e97e1baf1bb5e0462deb48.png)
+
+
+
+map 遍历初始函数 mapiterinit()
+
+它会先生成一个随机数，该随机数决定了从哪个 bucket 以及 从 bucket 的哪个位置开始遍历，达到一个随机性的效果
+
+当某个 bucket 遍历完成后，会继续遍历它的 overflow
+
+```go
+func mapiterinit(t *maptype, h *hmap, it *hiter) {
+
+    // 删除部分条件判断代码
+    
+	it.t = t
+	it.h = h
+
+	it.B = h.B
+	it.buckets = h.buckets
+
+    // 生成随机数 r
+	r := uintptr(fastrand())
+	if h.B > 31-bucketCntBits {
+		r += uintptr(fastrand()) << 31
+	}
+    // 决定从哪个 bucket 开始遍历
+	it.startBucket = r & bucketMask(h.B)
+    // 决定从 bucket 哪个位置开始遍历（比如 offset = 5，那么往后所有的 bucket 都会从第 5 个位置开始遍历）
+	it.offset = uint8(r >> h.B & (bucketCnt - 1))
+
+	it.bucket = it.startBucket
+
+	if old := h.flags; old&(iterator|oldIterator) != iterator|oldIterator {
+		atomic.Or8(&h.flags, iterator|oldIterator)
+	}
+
+	mapiternext(it)
+}
+```
